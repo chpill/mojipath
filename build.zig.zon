@@ -1,0 +1,12 @@
+.{
+    .name = .mojipath,
+    .version = "0.0.1",
+    .fingerprint = 0x446f3b1cbcdbaad8,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
