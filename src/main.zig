@@ -25,6 +25,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
             else => return e,
         };
         const c = cs[0];
+
         if (j > path_prefix.len - 1) {
             if (j == path_prefix.len + path_hash_len) {
                 if (c == '-') {
@@ -35,6 +36,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
                 } else {
                     _ = try out.writeAll(acc[0..j]);
                     _ = try out.writeAll(cs);
+                    if (c == '\n') try out.flush();
                     j = 0;
                 }
             } else {
@@ -46,6 +48,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
                 } else {
                     _ = try out.writeAll(acc[0..j]);
                     _ = try out.writeAll(cs);
+                    if (c == '\n') try out.flush();
                     j = 0;
                 }
             }
@@ -56,6 +59,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
             } else {
                 _ = try out.writeAll(acc[0..j]);
                 _ = try out.write(cs);
+                if (c == '\n') try out.flush();
                 j = 0;
             }
         }
@@ -72,8 +76,15 @@ pub fn main(init: std.process.Init) !u8 {
     const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
 
-    try mojipath(stdin, stdout);
+    // TODO: error.WriteFailed should be unwrapped to surface the root problem?
+    // https://ziggit.dev/t/file-i-o-basics-0-16/14968/4
+    mojipath(stdin, stdout) catch |err| switch (err) {
+        error.ReadFailed => return stdin_reader.err.?,
+        error.WriteFailed => return stdout_writer.err.?,
+        else => return err,
+    };
     try stdout.flush();
+
     return 0;
 }
 
