@@ -26,43 +26,31 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
         };
         const c = cs[0];
 
-        if (j > path_prefix.len - 1) {
-            if (j == path_prefix.len + path_hash_len) {
-                if (c == '-') {
-                    const modifier = acc_idx[0] + acc_idx[1] + acc_idx[2] + acc_idx[3];
-                    const codepoint: u21 = start_code_point + modifier;
-                    _ = try out.print("\u{2b21} {u}-", .{codepoint});
-                    j = 0;
-                } else {
-                    _ = try out.writeAll(acc[0..j]);
-                    _ = try out.writeAll(cs);
-                    if (c == '\n') try out.flush();
-                    j = 0;
-                }
-            } else {
-                const found = std.mem.find(u8, path_hash_alphabet, cs);
-                if (found) |f| {
-                    acc_idx[j - path_prefix.len] = @intCast(f);
-                    acc[j] = path_hash_alphabet[f];
-                    j += 1;
-                } else {
-                    _ = try out.writeAll(acc[0..j]);
-                    _ = try out.writeAll(cs);
-                    if (c == '\n') try out.flush();
-                    j = 0;
-                }
-            }
-        } else {
+        if (j == path_prefix.len + path_hash_len and c == '-') {
+            const modifier = acc_idx[0] + acc_idx[1] + acc_idx[2] + acc_idx[3];
+            const codepoint: u21 = start_code_point + modifier;
+            try out.print("\u{2b21} {u}-", .{codepoint});
+            j = 0;
+            continue;
+        }
+        if (j < path_prefix.len) {
             if (c == path_prefix[j]) {
                 acc[j] = c;
                 j += 1;
-            } else {
-                _ = try out.writeAll(acc[0..j]);
-                _ = try out.write(cs);
-                if (c == '\n') try out.flush();
-                j = 0;
-            }
+                continue;
+            } else {} // fall through to reset
+        } else if (std.mem.find(u8, path_hash_alphabet, cs)) |found| {
+            acc_idx[j - path_prefix.len] = @intCast(found);
+            acc[j] = path_hash_alphabet[found];
+            j += 1;
+            continue;
         }
+
+        // If the control flow reaches here, there is no match, reset everything
+        try out.writeAll(acc[0..j]);
+        try out.writeAll(cs);
+        if (c == '\n') try out.flush();
+        j = 0;
     }
 }
 
