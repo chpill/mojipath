@@ -112,11 +112,11 @@
         "zig-flake": "zig-flake"
       },
       "locked": {
-        "lastModified": 1792017146,
-        "narHash": "sha256-mcvZhsaKBamwMv/Vb2PlOFsvaJEJi+s62I0TXE1Jimo=",
+        "lastModified": 1792166614,
+        "narHash": "sha256-hiaala3tDtiV1oUmmxuP/c6cMpzSXayP1r/x8b1/pec=",
         "owner": "zigtools",
         "repo": "zls",
-        "rev": "68d88cec805c2de8710f5e7002103ab490c99ce2",
+        "rev": "15a17a900334045c5fde8c4577d2f9a55c7c196f",
         "type": "github"
       },
       "original": {

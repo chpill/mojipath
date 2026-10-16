@@ -289,7 +289,8 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
     var mode: Color = .auto;
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--color=")) {

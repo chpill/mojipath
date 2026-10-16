@@ -57,8 +57,20 @@ At your own risk: other programs see pipes instead of a terminal, so they may
 disable colors, hide progress bars, or misbehave (vim, less), and stdout/stderr
 interleaving can shift. Not available in fish, which has no `exec > >(...)`.
 
+## Packages
+
+Built with stable Zig 0.17.0. `nix build .#mojipath-<target>` for:
+
+- `x86_64-linux-musl`, `aarch64-linux-musl` — static ELF, runs on any Linux
+- `x86_64-macos`, `aarch64-macos` — Mach-O
+- `x86_64-windows-gnu` — standalone `.exe`
+
+`nix build .#default` picks the native triple for the host. As a flake input:
+`inputs.mojipath.packages.<system>.mojipath-<target>`.
+
 ## Development
 
 - Build: `zig build`
 - Test: `zig build test`
+- Nix checks (unit tests + per-target smoke tests, incl. qemu/wine): `nix flake check`
 - Palette: `zig run src/emoji_range_viz.zig`
