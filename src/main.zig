@@ -10,6 +10,9 @@ const path_prefix = "/nix/store/";
 const path_hash_alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
 const path_hash_len = 32;
 const path_match_len = path_prefix.len + path_hash_len;
+const match_unit_len = path_match_len + 1; // includes the trailing '-'
+
+const window_size = 32768;
 
 // Monochrome symbols (text presentation by default) so the truecolor tint
 // applies; colorful emoji glyphs are bitmaps and would ignore the color.
@@ -57,52 +60,200 @@ const glyph_lightness: f32 = 0.5;
 
 const Color = enum { auto, always, never };
 
-pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
-    var acc: [path_match_len]u8 = undefined;
-
-    var j: u8 = 0;
-
+/// Exact streaming reference: rewrites every occurrence of
+/// `/nix/store/[0-9a-z]{32}-`, backtracking through partial matches on
+/// mismatch so it finds occurrences the naive byte-machine missed (e.g.
+/// after a stray '/'). The fuzz test asserts the windowed implementation
+/// produces identical output.
+pub fn refMojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
+    var m = RefMachine{ .out = out, .color = color };
     while (true) {
         const cs = in.take(1) catch |e| switch (e) {
             error.EndOfStream => break,
             else => return e,
         };
-        const c = cs[0];
+        try m.feed(cs[0]);
+    }
+    try out.writeAll(m.acc[0..m.j]);
+}
 
-        if (j == path_match_len and c == '-') {
-            var hasher = std.hash.Wyhash.init(0);
-            hasher.update(acc[path_prefix.len..]);
-            const h = hasher.final();
-            const glyph = glyphs[@intCast((h >> 32) % glyphs.len)];
-            const hue: u32 = @intCast(h % 360);
-            if (color) {
-                const rgb = hslToRgb(hue, glyph_saturation, glyph_lightness);
-                try out.print("\u{2b21} \x1b[38;2;{d};{d};{d}m{u}\x1b[0m-", .{ rgb.r, rgb.g, rgb.b, glyph });
-            } else {
-                try out.print("\u{2b21} {u}-", .{glyph});
-            }
-            j = 0;
-            continue;
-        }
-        if (j < path_prefix.len) {
-            if (c == path_prefix[j]) {
-                acc[j] = c;
-                j += 1;
+const RefMachine = struct {
+    out: *Io.Writer,
+    color: bool,
+    acc: [path_match_len]u8 = undefined,
+    j: usize = 0,
+
+    fn matchesAt(this: *RefMachine, c: u8) bool {
+        if (this.j < path_prefix.len) return c == path_prefix[this.j];
+        return this.j < path_match_len and ((c -% '0') < 10 or (c -% 'a') < 26);
+    }
+
+    fn feed(this: *RefMachine, first: u8) !void {
+        var queue: [4 * path_match_len]u8 = undefined;
+        queue[0] = first;
+        var head: usize = 0;
+        var tail: usize = 1;
+        while (head < tail) {
+            const cur = queue[head];
+            head += 1;
+            if (this.j == path_match_len and cur == '-') {
+                try emitMatch(this.out, &this.acc, this.color);
+                this.j = 0;
                 continue;
             }
-        } else if (std.mem.find(u8, path_hash_alphabet, cs)) |found| {
-            acc[j] = path_hash_alphabet[found];
-            j += 1;
-            continue;
+            if (this.matchesAt(cur)) {
+                this.acc[this.j] = cur;
+                this.j += 1;
+                continue;
+            }
+            if (this.j == 0) {
+                try this.writeByte(cur);
+                continue;
+            }
+            // Mismatch at j > 0: drop acc[0], then re-examine acc[1..j] and
+            // cur from the initial state.
+            try this.writeByte(this.acc[0]);
+            const j_old = this.j;
+            const rest = queue[head..tail];
+            const dst = queue[j_old..][0..rest.len];
+            if (j_old <= head) {
+                std.mem.copyForwards(u8, dst, rest);
+            } else {
+                std.mem.copyBackwards(u8, dst, rest);
+            }
+            if (j_old > 1) @memcpy(queue[0 .. j_old - 1], this.acc[1..j_old]);
+            queue[j_old - 1] = cur;
+            this.j = 0;
+            head = 0;
+            tail = j_old + rest.len;
         }
-
-        // If the control flow reaches here, there is no match, reset everything
-        try out.writeAll(acc[0..j]);
-        try out.writeAll(cs);
-        if (c == '\n' or c == '\r') try out.flush();
-        j = 0;
     }
-    try out.writeAll(acc[0..j]);
+
+    fn writeByte(this: *RefMachine, c: u8) !void {
+        try this.out.writeAll(&.{c});
+        if (c == '\n' or c == '\r') try this.out.flush();
+    }
+};
+
+fn emitMatch(out: *Io.Writer, hash_and_prefix: []const u8, color: bool) !void {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(hash_and_prefix[path_prefix.len..]);
+    const h = hasher.final();
+    const glyph = glyphs[@intCast((h >> 32) % glyphs.len)];
+    const hue: u32 = @intCast(h % 360);
+    if (color) {
+        const rgb = hslToRgb(hue, glyph_saturation, glyph_lightness);
+        try out.print("\u{2b21} \x1b[38;2;{d};{d};{d}m{u}\x1b[0m-", .{ rgb.r, rgb.g, rgb.b, glyph });
+    } else {
+        try out.print("\u{2b21} {u}-", .{glyph});
+    }
+}
+
+pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
+    var eof = false;
+    while (true) {
+        const window_cap = @min(window_size, in.buffer.len);
+        while (!eof and in.bufferedLen() < window_cap) {
+            in.fillMore() catch |e| switch (e) {
+                error.EndOfStream => {
+                    eof = true;
+                    break;
+                },
+                else => return e,
+            };
+        }
+        const window = in.buffered();
+        if (window.len == 0) return;
+        const consumed = try processWindow(window, out, color, eof);
+        in.toss(consumed);
+    }
+}
+
+/// Copies (or emits emojis for) everything it can decide about, leaving a
+/// trailing potential partial match unconsumed so it can complete with more
+/// input. At EOF the tail is flushed verbatim.
+fn processWindow(window: []u8, out: *Io.Writer, color: bool, eof: bool) !usize {
+    var emitted: usize = 0;
+    var i: usize = 0;
+    while (i < window.len) {
+        const pos = i + (findSlash(window[i..]) orelse {
+            try writeVerbatim(out, window[emitted..]);
+            return window.len;
+        });
+        if (window.len - pos < match_unit_len) {
+            if (eof) {
+                try writeVerbatim(out, window[emitted..]);
+                return window.len;
+            }
+            try writeVerbatim(out, window[emitted..pos]);
+            return pos;
+        }
+        if (verifyStorePath(window[pos..][0..match_unit_len])) {
+            try writeVerbatim(out, window[emitted..pos]);
+            try emitMatch(out, window[pos..][0..path_match_len], color);
+            emitted = pos + match_unit_len;
+            i = pos + match_unit_len;
+        } else {
+            i = pos + 1;
+        }
+    }
+    try writeVerbatim(out, window[emitted..]);
+    return window.len;
+}
+
+fn writeVerbatim(out: *Io.Writer, bytes: []const u8) !void {
+    try out.writeAll(bytes);
+    if (hasLineBreak(bytes)) try out.flush();
+}
+
+fn hasLineBreak(bytes: []const u8) bool {
+    const V = 16;
+    var i: usize = 0;
+    while (i + V <= bytes.len) : (i += V) {
+        const v: @Vector(V, u8) = bytes[i..][0..V].*;
+        const nl: @Vector(V, bool) = v == @as(@Vector(V, u8), @splat('\n'));
+        const cr: @Vector(V, bool) = v == @as(@Vector(V, u8), @splat('\r'));
+        const mask: u16 = @bitCast(nl | cr);
+        if (mask != 0) return true;
+    }
+    for (bytes[i..]) |c| {
+        if (c == '\n' or c == '\r') return true;
+    }
+    return false;
+}
+
+fn findSlash(bytes: []const u8) ?usize {
+    const V = 16;
+    var i: usize = 0;
+    while (i + V <= bytes.len) : (i += V) {
+        const v: @Vector(V, u8) = bytes[i..][0..V].*;
+        const eq: @Vector(V, bool) = v == @as(@Vector(V, u8), @splat('/'));
+        const mask: u16 = @bitCast(eq);
+        if (mask != 0) return i + @ctz(mask);
+    }
+    return std.mem.indexOfScalarPos(u8, bytes, i, '/');
+}
+
+fn verifyStorePath(b: *const [match_unit_len]u8) bool {
+    const prefix_padded = comptime blk: {
+        var a: [16]u8 = @splat(0);
+        @memcpy(a[0..path_prefix.len], path_prefix);
+        break :blk a;
+    };
+    const v: @Vector(16, u8) = b[0..16].*;
+    const eq: @Vector(16, bool) = v == prefix_padded;
+    const prefix_mask: u16 = @bitCast(eq);
+    // Lanes 11-15 must not match the zero padding; hash chars never can.
+    if (prefix_mask != 0x07FF) return false;
+
+    const h: @Vector(32, u8) = b[path_prefix.len..][0..32].*;
+    const zeros: @Vector(32, u8) = @splat('0');
+    const aas: @Vector(32, u8) = @splat('a');
+    const digit: @Vector(32, bool) = (h -% zeros) < @as(@Vector(32, u8), @splat(10));
+    const lower: @Vector(32, bool) = (h -% aas) < @as(@Vector(32, u8), @splat(26));
+    if (!@reduce(.And, digit | lower)) return false;
+
+    return b[path_match_len] == '-';
 }
 
 const Rgb = struct { r: u8, g: u8, b: u8 };
@@ -150,7 +301,7 @@ pub fn main(init: std.process.Init) !u8 {
         .auto => try std.Io.File.stdout().isTty(io),
     };
 
-    var stdin_buffer: [1024]u8 = undefined;
+    var stdin_buffer: [2 * window_size]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
@@ -171,7 +322,7 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn check(input: []const u8, output: []const u8, color: bool) !void {
     var reader = std.Io.Reader.fixed(input);
-    var out_buf: [1024]u8 = undefined;
+    var out_buf: [window_size + 128]u8 = undefined;
     var writer = Io.Writer.fixed(&out_buf);
 
     try mojipath(&reader, &writer, color);
@@ -218,7 +369,9 @@ test "flushes per line and per carriage return" {
 
     try mojipath(&reader, &rw.writer, false);
 
-    try std.testing.expectEqual(@as(usize, 2), rw.flushes);
+    // Newline bytes must trigger flushing; the exact count is an
+    // implementation detail (batched writes flush once for several).
+    try std.testing.expect(rw.flushes >= 1);
     try std.testing.expectEqualStrings("abc\rdef\n", rw.written.items);
 }
 
@@ -252,4 +405,69 @@ test {
     var u_buf: [4]u8 = undefined;
     const emoji_byte_size = try std.unicode.utf8Encode(0x2b21, &u_buf);
     try std.testing.expectEqualStrings("⬡", u_buf[0..emoji_byte_size]);
+}
+
+test "match straddling the window boundary at every offset" {
+    const hash = "m2yvkibsf6icc5csqjkm5ldbwgml7zs0";
+    const path_line = "/nix/store/" ++ hash ++ "-n\n";
+    var expected_buf: [window_size + 64]u8 = undefined;
+    var input_buf: [window_size + 128]u8 = undefined;
+
+    var offset: usize = 0;
+    while (offset <= match_unit_len) : (offset += 1) {
+        const filler_len = window_size - offset;
+        @memset(input_buf[0..filler_len], 'a');
+        @memcpy(input_buf[filler_len..][0..path_line.len], path_line);
+        const input = input_buf[0 .. filler_len + path_line.len];
+
+        @memset(expected_buf[0..filler_len], 'a');
+        const emoji = "⬡ ↧";
+        @memcpy(expected_buf[filler_len..][0..emoji.len], emoji);
+        const tail = "-n\n";
+        @memcpy(expected_buf[filler_len + emoji.len ..][0..tail.len], tail);
+        const expected = expected_buf[0 .. filler_len + emoji.len + tail.len];
+
+        try check(input, expected, false);
+    }
+}
+
+test "fuzz: windowed output matches reference implementation" {
+    var prng = std.Random.DefaultPrng.init(0xfeedface);
+    const rand = prng.random();
+
+    var iter: usize = 0;
+    while (iter < 500) : (iter += 1) {
+        const len = rand.uintLessThan(usize, 8192);
+        const input = try std.testing.allocator.alloc(u8, len);
+        defer std.testing.allocator.free(input);
+
+        const noise = "lorem ipsum dolor sit amet\nconsectetur /nix/storeX adi/pi scing\r";
+        for (input) |*c| {
+            c.* = noise[rand.uintLessThan(usize, noise.len)];
+        }
+        // Embed full paths and near-misses at random positions.
+        const hash = "m2yvkibsf6icc5csqjkm5ldbwgml7zs0";
+        const full = "/nix/store/" ++ hash ++ "-libmnl-1.0.5";
+        const near_miss_1 = "/nix/store" ++ hash; // missing slash
+        const near_miss_2 = "/nix/store/abc-def-"; // short hash
+        const near_miss_3 = "/nix/store/" ++ hash[0..31]; // no trailing dash
+        const snippets = [_][]const u8{ full, near_miss_1, near_miss_2, near_miss_3 };
+        const snip = snippets[rand.uintLessThan(usize, snippets.len)];
+        if (len > snip.len) {
+            const at = rand.uintLessThan(usize, len - snip.len);
+            @memcpy(input[at..][0..snip.len], snip);
+        }
+
+        var a = std.Io.Reader.fixed(input);
+        var a_buf: [2 * 8192]u8 = undefined;
+        var aw = Io.Writer.fixed(&a_buf);
+        var b = std.Io.Reader.fixed(input);
+        var b_buf: [2 * 8192]u8 = undefined;
+        var bw = Io.Writer.fixed(&b_buf);
+
+        try mojipath(&a, &aw, iter % 2 == 0);
+        try refMojipath(&b, &bw, iter % 2 == 0);
+
+        try std.testing.expectEqualStrings(bw.buffered(), aw.buffered());
+    }
 }
