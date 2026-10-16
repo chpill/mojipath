@@ -1,3 +1,4 @@
+/// outputs emojis and there codepoint ranges, to help select "good-looking" ones
 const std = @import("std");
 
 pub fn main() void {
