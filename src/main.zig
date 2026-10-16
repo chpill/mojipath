@@ -157,8 +157,11 @@ fn emitMatch(out: *Io.Writer, hash_and_prefix: []const u8, color: bool) !void {
 pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
     var eof = false;
     while (true) {
-        const window_cap = @min(window_size, in.buffer.len);
-        while (!eof and in.bufferedLen() < window_cap) {
+        // Wait only for the minimum unit a decision can be made about, so
+        // interactive (watch-style) input stays progressive; full windows
+        // still arrive per-read from bulk sources.
+        const min_window = @min(match_unit_len, in.buffer.len);
+        while (!eof and in.bufferedLen() < min_window) {
             in.fillMore() catch |e| switch (e) {
                 error.EndOfStream => {
                     eof = true;
@@ -369,6 +372,36 @@ const RecordingWriter = struct {
     }
 };
 
+/// Serves input in chunks; between chunks, records whether the consumer
+/// already produced output from the earlier ones (i.e. did not stall until
+/// a full window or EOF). Serves chunks partially when asked to, like a
+/// real stream would.
+const DribbleReader = struct {
+    interface: Io.Reader,
+    chunks: []const []const u8,
+    chunk_idx: usize = 0,
+    offset: usize = 0,
+    writer_state: *RecordingWriter,
+    saw_progress: *bool,
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const this: *DribbleReader = @alignCast(@fieldParentPtr("interface", r));
+        if (this.chunk_idx >= this.chunks.len) return error.EndOfStream;
+        if (this.chunk_idx > 0 and this.offset == 0) {
+            if (this.writer_state.written.items.len > 0) this.saw_progress.* = true;
+        }
+        const chunk = this.chunks[this.chunk_idx][this.offset..];
+        const n = limit.minInt(chunk.len);
+        try w.writeAll(chunk[0..n]);
+        this.offset += n;
+        if (this.offset >= this.chunks[this.chunk_idx].len) {
+            this.chunk_idx += 1;
+            this.offset = 0;
+        }
+        return n;
+    }
+};
+
 test "flushes per line and per carriage return" {
     var buf: [1024]u8 = undefined;
     var rw = RecordingWriter.init(&buf);
@@ -381,6 +414,35 @@ test "flushes per line and per carriage return" {
     // implementation detail (batched writes flush once for several).
     try std.testing.expect(rw.flushes >= 1);
     try std.testing.expectEqualStrings("abc\rdef\n", rw.written.items);
+}
+
+test "emits output before input ends (watch-mode progressiveness)" {
+    var buf: [1024]u8 = undefined;
+    var rw = RecordingWriter.init(&buf);
+    defer rw.written.deinit(std.testing.allocator);
+
+    const line1 = "/nix/store/m2yvkibsf6icc5csqjkm5ldbwgml7zs0-libmnl-1.0.5.drv\n";
+    const line2 = "more output\n";
+    const chunks = [_][]const u8{ line1, line2 };
+    var saw_progress = false;
+    var dribble_buffer: [64]u8 = undefined;
+    var dribble = DribbleReader{
+        .interface = .{
+            .vtable = &.{ .stream = DribbleReader.stream },
+            .buffer = &dribble_buffer,
+            .seek = 0,
+            .end = 0,
+        },
+        .chunks = &chunks,
+        .writer_state = &rw,
+        .saw_progress = &saw_progress,
+    };
+
+    try mojipath(&dribble.interface, &rw.writer, false);
+    try rw.writer.flush();
+
+    try std.testing.expect(saw_progress);
+    try std.testing.expectEqualStrings("⬡ ↧-libmnl-1.0.5.drv\n" ++ line2, rw.written.items);
 }
 
 test {
