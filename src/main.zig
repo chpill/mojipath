@@ -52,6 +52,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
         if (c == '\n') try out.flush();
         j = 0;
     }
+    try out.writeAll(acc[0..j]);
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -97,6 +98,13 @@ test {
         \\ /nix/store/m2yvkibsf6icc5csqjkm5ldbwgml7zs0-libmnl-1.0.5.drv
     ,
         \\ ⬡ ⚡-libmnl-1.0.5.drv
+    );
+
+    // Input ending mid-match should be flushed verbatim, not dropped.
+    try check(
+        \\ /nix/store/m2yvkibsf6icc5csqjkm5ldbwgml7zs0
+    ,
+        \\ /nix/store/m2yvkibsf6icc5csqjkm5ldbwgml7zs0
     );
 
     var u_buf: [4]u8 = undefined;
