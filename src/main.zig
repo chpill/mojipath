@@ -99,7 +99,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
         // If the control flow reaches here, there is no match, reset everything
         try out.writeAll(acc[0..j]);
         try out.writeAll(cs);
-        if (c == '\n') try out.flush();
+        if (c == '\n' or c == '\r') try out.flush();
         j = 0;
     }
     try out.writeAll(acc[0..j]);
@@ -177,6 +177,49 @@ fn check(input: []const u8, output: []const u8, color: bool) !void {
     try mojipath(&reader, &writer, color);
 
     try std.testing.expectEqualStrings(output, writer.buffered());
+}
+
+const RecordingWriter = struct {
+    written: std.ArrayList(u8) = .empty,
+    flushes: usize = 0,
+    writer: Io.Writer,
+
+    fn init(buffer: []u8) RecordingWriter {
+        return .{ .writer = .{
+            .buffer = buffer,
+            .vtable = &.{ .drain = drain },
+        } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const this: *RecordingWriter = @alignCast(@fieldParentPtr("writer", w));
+        this.flushes += 1;
+        this.append(w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n = w.buffered().len;
+        for (data[0 .. data.len - 1]) |slice| {
+            this.append(slice) catch return error.WriteFailed;
+            n += slice.len;
+        }
+        for (0..splat) |_| this.append(data[data.len - 1]) catch return error.WriteFailed;
+        return n + splat * data[data.len - 1].len;
+    }
+
+    fn append(this: *RecordingWriter, bytes: []const u8) !void {
+        try this.written.appendSlice(std.testing.allocator, bytes);
+    }
+};
+
+test "flushes per line and per carriage return" {
+    var buf: [1024]u8 = undefined;
+    var rw = RecordingWriter.init(&buf);
+    var reader = Io.Reader.fixed("abc\rdef\n");
+    defer rw.written.deinit(std.testing.allocator);
+
+    try mojipath(&reader, &rw.writer, false);
+
+    try std.testing.expectEqual(@as(usize, 2), rw.flushes);
+    try std.testing.expectEqualStrings("abc\rdef\n", rw.written.items);
 }
 
 test {
