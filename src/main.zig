@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 // Example of a nix store path:
@@ -12,7 +13,11 @@ const path_hash_len = 32;
 const path_match_len = path_prefix.len + path_hash_len;
 const match_unit_len = path_match_len + 1; // includes the trailing '-'
 
-const window_size = 32768;
+pub const window_size = 32768;
+
+/// 32-byte vectors lower to real AVX2 ops only when the target enables it;
+/// otherwise they split into 2x SSE2 ops, so keep 16 unless told otherwise.
+const simd_width: comptime_int = if (builtin.cpu.has(.x86, .avx2)) 32 else 16;
 
 // Monochrome symbols (text presentation by default) so the truecolor tint
 // applies; colorful emoji glyphs are bitmaps and would ignore the color.
@@ -207,13 +212,14 @@ fn writeVerbatim(out: *Io.Writer, bytes: []const u8) !void {
 }
 
 fn hasLineBreak(bytes: []const u8) bool {
-    const V = 16;
+    const V = simd_width;
+    const MaskInt = if (V == 32) u32 else u16;
     var i: usize = 0;
     while (i + V <= bytes.len) : (i += V) {
         const v: @Vector(V, u8) = bytes[i..][0..V].*;
         const nl: @Vector(V, bool) = v == @as(@Vector(V, u8), @splat('\n'));
         const cr: @Vector(V, bool) = v == @as(@Vector(V, u8), @splat('\r'));
-        const mask: u16 = @bitCast(nl | cr);
+        const mask: MaskInt = @bitCast(nl | cr);
         if (mask != 0) return true;
     }
     for (bytes[i..]) |c| {
@@ -223,12 +229,13 @@ fn hasLineBreak(bytes: []const u8) bool {
 }
 
 fn findSlash(bytes: []const u8) ?usize {
-    const V = 16;
+    const V = simd_width;
+    const MaskInt = if (V == 32) u32 else u16;
     var i: usize = 0;
     while (i + V <= bytes.len) : (i += V) {
         const v: @Vector(V, u8) = bytes[i..][0..V].*;
         const eq: @Vector(V, bool) = v == @as(@Vector(V, u8), @splat('/'));
-        const mask: u16 = @bitCast(eq);
+        const mask: MaskInt = @bitCast(eq);
         if (mask != 0) return i + @ctz(mask);
     }
     return std.mem.indexOfScalarPos(u8, bytes, i, '/');

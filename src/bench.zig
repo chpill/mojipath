@@ -1,12 +1,13 @@
 /// Throughput benchmark: feeds synthetic input through both implementations
 /// in memory. Run with `zig run -OReleaseFast src/bench.zig` (add
-/// `-mcpu x86_64_v3` for AVX2).
+/// `-mcpu x86_64_v3` for AVX2). Alternates measurements and reports medians
+/// to cancel frequency-scaling drift.
 const std = @import("std");
 const Io = std.Io;
 const mojimod = @import("main.zig");
 
 const input_size = 8 * 1024 * 1024;
-const iterations = 5;
+const rounds = 9;
 
 pub fn main(init: std.process.Init) !void {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -17,35 +18,47 @@ pub fn main(init: std.process.Init) !void {
     const out_buf = try arena.alloc(u8, input.len + 64);
 
     const io = init.io;
-    const ref_ns: u64 = @intCast(try bench(io, input, out_buf, runRef));
-    const cur_ns: u64 = @intCast(try bench(io, input, out_buf, runCur));
+    var ceil_samples: [rounds]i96 = undefined;
+    var ref_samples: [rounds]i96 = undefined;
+    var cur_samples: [rounds]i96 = undefined;
+    for (0..rounds) |r| {
+        ceil_samples[r] = try benchOne(io, input, out_buf, runCeiling);
+        ref_samples[r] = try benchOne(io, input, out_buf, runRef);
+        cur_samples[r] = try benchOne(io, input, out_buf, runCur);
+    }
 
-    var stdout_buffer: [256]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const out = &stdout_writer.interface;
-    try out.print("input: {d} MiB x {d} iterations\n", .{ input_size / 1024 / 1024, iterations });
-    try out.print("reference byte-machine: {d:>3} MiB/s\n", .{mibPerSec(ref_ns)});
-    try out.print("current implementation: {d:>3} MiB/s\n", .{mibPerSec(cur_ns)});
-    try out.print("speedup: {d:.2}x\n", .{@as(f64, @floatFromInt(ref_ns)) / @as(f64, @floatFromInt(cur_ns))});
+    try out.print("input: {d} MiB, median of {d} interleaved rounds\n", .{ input_size / 1024 / 1024, rounds });
+    try out.print("memcpy ceiling:         {d:>6} MiB/s\n", .{mibPerSec(median(&ceil_samples))});
+    try out.print("reference byte-machine: {d:>6} MiB/s\n", .{mibPerSec(median(&ref_samples))});
+    try out.print("current implementation: {d:>6} MiB/s\n", .{mibPerSec(median(&cur_samples))});
+    try out.print("ratio impl/ceiling: {d:.2}\n", .{
+        @as(f64, @floatFromInt(median(&ceil_samples))) / @as(f64, @floatFromInt(median(&cur_samples))),
+    });
     try out.flush();
 }
 
-fn mibPerSec(ns: u64) u64 {
-    const total = @as(u64, input_size) * iterations;
-    return total * std.time.ns_per_s / (ns * 1024 * 1024);
+fn median(samples: []i96) i96 {
+    std.mem.sort(i96, samples, {}, std.sort.asc(i96));
+    return samples[samples.len / 2];
 }
 
-fn bench(io: std.Io, input: []const u8, out_buf: []u8, comptime run: fn ([]const u8, []u8) anyerror!usize) !i96 {
-    var total: usize = 0;
-    var sum: i96 = 0;
-    for (0..iterations) |_| {
-        const start = Io.Clock.awake.now(io).nanoseconds;
-        const n = try run(input, out_buf);
-        sum += Io.Clock.awake.now(io).nanoseconds - start;
-        total += n;
-    }
-    std.mem.doNotOptimizeAway(total);
-    return sum;
+fn mibPerSec(ns: i96) u64 {
+    const total: i96 = input_size;
+    return @intCast(@divTrunc(total * std.time.ns_per_s, ns * 1024 * 1024));
+}
+
+fn benchOne(io: std.Io, input: []const u8, out_buf: []u8, comptime run: fn ([]const u8, []u8) anyerror!usize) !i96 {
+    var checksum: usize = 0;
+    const start = Io.Clock.awake.now(io).nanoseconds;
+    checksum += try run(input, out_buf);
+    checksum += try run(input, out_buf);
+    checksum += try run(input, out_buf);
+    const elapsed = Io.Clock.awake.now(io).nanoseconds - start;
+    std.mem.doNotOptimizeAway(checksum);
+    return @divTrunc(elapsed, 3);
 }
 
 fn runRef(input: []const u8, out_buf: []u8) !usize {
@@ -60,6 +73,15 @@ fn runCur(input: []const u8, out_buf: []u8) !usize {
     var writer = Io.Writer.fixed(out_buf);
     try mojimod.mojipath(&reader, &writer, false);
     return writer.buffered().len;
+}
+
+fn runCeiling(input: []const u8, out_buf: []u8) !usize {
+    var writer = Io.Writer.fixed(out_buf);
+    var i: usize = 0;
+    while (i < input.len) : (i += mojimod.window_size) {
+        try writer.writeAll(input[i..@min(i + mojimod.window_size, input.len)]);
+    }
+    return input.len;
 }
 
 fn buildInput(arena: std.mem.Allocator) ![]u8 {
