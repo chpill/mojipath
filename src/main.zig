@@ -9,12 +9,13 @@ const Io = std.Io;
 const path_prefix = "/nix/store/";
 const path_hash_alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
 const path_hash_len = 32;
+const path_match_len = path_prefix.len + path_hash_len;
 
 // TODO: curate some "ranges" of cool emojis to use
 const start_code_point = 0x2648;
 
 pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
-    var acc: [43]u8 = undefined;
+    var acc: [path_match_len]u8 = undefined;
     var acc_idx: [32]u21 = undefined;
 
     var j: u8 = 0;
@@ -26,7 +27,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
         };
         const c = cs[0];
 
-        if (j == path_prefix.len + path_hash_len and c == '-') {
+        if (j == path_match_len and c == '-') {
             const modifier = acc_idx[0] + acc_idx[1] + acc_idx[2] + acc_idx[3];
             const codepoint: u21 = start_code_point + modifier;
             try out.print("\u{2b21} {u}-", .{codepoint});
@@ -38,7 +39,7 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer) !void {
                 acc[j] = c;
                 j += 1;
                 continue;
-            } else {} // fall through to reset
+            }
         } else if (std.mem.find(u8, path_hash_alphabet, cs)) |found| {
             acc_idx[j - path_prefix.len] = @intCast(found);
             acc[j] = path_hash_alphabet[found];
