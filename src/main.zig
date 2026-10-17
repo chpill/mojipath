@@ -158,49 +158,40 @@ fn emitMatch(out: *Io.Writer, hash_and_prefix: []const u8, color: bool) !void {
 /// abstraction, so tests can script idle periods deterministically.
 pub const WaitResult = enum { input_ready, timeout };
 
-pub const Readiness = struct {
-    ctx: *anyopaque,
-    waitFn: *const fn (ctx: *anyopaque, timeout_ns: u64) WaitResult,
-
-    pub fn wait(self: Readiness, timeout_ns: u64) WaitResult {
-        return self.waitFn(self.ctx, timeout_ns);
-    }
-};
-
 /// Rewrites a store path when input has been idle this long, accepting that
 /// a path split across the gap stays raw.
 pub const idle_flush_ns: u64 = 10 * std.time.ns_per_ms;
 
+/// Policy whose wait always claims readiness: the fill itself blocks until
+/// data or EOF, so no idle flush ever occurs.
+pub const Blocking = struct {
+    pub fn wait(self: Blocking, timeout_ns: u64) WaitResult {
+        _ = self;
+        _ = timeout_ns;
+        return .input_ready;
+    }
+};
+
 const FillResult = enum { filled, idle };
 
-/// Performs one read; with a readiness policy, gates it so idle gaps are
+/// Performs one read, gated by the readiness policy so idle gaps are
 /// reported instead of blocking.
-fn fillOne(in: *Io.Reader, readiness: ?Readiness, eof: *bool) !FillResult {
-    const doFill = struct {
-        fn go(reader: *Io.Reader, eof_ptr: *bool) !void {
-            reader.fillMore() catch |e| switch (e) {
+fn fillOne(in: *Io.Reader, readiness: anytype, eof: *bool) !FillResult {
+    switch (readiness.wait(idle_flush_ns)) {
+        .input_ready => {
+            in.fillMore() catch |e| switch (e) {
                 error.EndOfStream => {
-                    eof_ptr.* = true;
+                    eof.* = true;
                 },
                 else => return e,
             };
-        }
-    }.go;
-
-    if (readiness) |r| {
-        switch (r.wait(idle_flush_ns)) {
-            .input_ready => {
-                try doFill(in, eof);
-                return .filled;
-            },
-            .timeout => return .idle,
-        }
+            return .filled;
+        },
+        .timeout => return .idle,
     }
-    try doFill(in, eof);
-    return .filled;
 }
 
-pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool, readiness: ?Readiness) !void {
+pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool, readiness: anytype) !void {
     var eof = false;
     outer: while (true) {
         // Process whatever a single read delivered; interactive (watch-style)
@@ -373,11 +364,9 @@ pub fn main(init: std.process.Init) !u8 {
     const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
 
-    var stdin_readiness = StdinReadiness{ .fd = std.Io.File.stdin().handle };
-
     // TODO: error.WriteFailed should be unwrapped to surface the root problem?
     // https://ziggit.dev/t/file-i-o-basics-0-16/14968/4
-    mojipath(stdin, stdout, color, stdin_readiness.readiness()) catch |err| switch (err) {
+    mojipath(stdin, stdout, color, StdinReadiness{ .fd = std.Io.File.stdin().handle }) catch |err| switch (err) {
         error.ReadFailed => return stdin_reader.err.?,
         error.WriteFailed => return stdout_writer.err.?,
         else => return err,
@@ -392,12 +381,7 @@ pub fn main(init: std.process.Init) !u8 {
 const StdinReadiness = struct {
     fd: std.posix.fd_t,
 
-    fn readiness(self: *StdinReadiness) Readiness {
-        return .{ .ctx = self, .waitFn = wait };
-    }
-
-    fn wait(ctx: *anyopaque, timeout_ns: u64) WaitResult {
-        const self: *StdinReadiness = @ptrCast(@alignCast(ctx));
+    fn wait(self: StdinReadiness, timeout_ns: u64) WaitResult {
         var fds = [_]std.posix.pollfd{.{
             .fd = self.fd,
             .events = std.posix.POLL.IN,
@@ -414,7 +398,7 @@ fn check(input: []const u8, output: []const u8, color: bool) !void {
     var out_buf: [window_size + 128]u8 = undefined;
     var writer = Io.Writer.fixed(&out_buf);
 
-    try mojipath(&reader, &writer, color, null);
+    try mojipath(&reader, &writer, color, Blocking{});
 
     try std.testing.expectEqualStrings(output, writer.buffered());
 }
@@ -486,7 +470,7 @@ test "flushes per line and per carriage return" {
     var reader = Io.Reader.fixed("abc\rdef\n");
     defer rw.written.deinit(std.testing.allocator);
 
-    try mojipath(&reader, &rw.writer, false, null);
+    try mojipath(&reader, &rw.writer, false, Blocking{});
 
     // Newline bytes must trigger flushing; the exact count is an
     // implementation detail (batched writes flush once for several).
@@ -516,7 +500,7 @@ test "emits output before input ends (watch-mode progressiveness)" {
         .saw_progress = &saw_progress,
     };
 
-    try mojipath(&dribble.interface, &rw.writer, false, null);
+    try mojipath(&dribble.interface, &rw.writer, false, Blocking{});
     try rw.writer.flush();
 
     try std.testing.expect(saw_progress);
@@ -545,7 +529,7 @@ test "emits short bursts before more input arrives" {
         .saw_progress = &saw_progress,
     };
 
-    try mojipath(&dribble.interface, &rw.writer, false, null);
+    try mojipath(&dribble.interface, &rw.writer, false, Blocking{});
     try rw.writer.flush();
 
     try std.testing.expect(saw_progress);
@@ -557,12 +541,7 @@ const ScriptedReadiness = struct {
     idx: usize = 0,
     first_timeout: ?u64 = null,
 
-    fn readiness(self: *ScriptedReadiness) Readiness {
-        return .{ .ctx = self, .waitFn = wait };
-    }
-
-    fn wait(ctx: *anyopaque, timeout_ns: u64) WaitResult {
-        const self: *ScriptedReadiness = @ptrCast(@alignCast(ctx));
+    fn wait(self: *ScriptedReadiness, timeout_ns: u64) WaitResult {
         if (self.first_timeout == null) self.first_timeout = timeout_ns;
         if (self.idx >= self.events.len) return .input_ready;
         const event = self.events[self.idx];
@@ -595,7 +574,7 @@ test "flushes retained path-prefix bytes when input goes idle" {
         .saw_progress = &saw_progress,
     };
 
-    try mojipath(&dribble.interface, &rw.writer, false, scripted.readiness());
+    try mojipath(&dribble.interface, &rw.writer, false, &scripted);
     try rw.writer.flush();
 
     try std.testing.expect(saw_progress);
@@ -693,7 +672,7 @@ test "fuzz: windowed output matches reference implementation" {
         var b_buf: [2 * 8192]u8 = undefined;
         var bw = Io.Writer.fixed(&b_buf);
 
-        try mojipath(&a, &aw, iter % 2 == 0, null);
+        try mojipath(&a, &aw, iter % 2 == 0, Blocking{});
         try refMojipath(&b, &bw, iter % 2 == 0);
 
         try std.testing.expectEqualStrings(bw.buffered(), aw.buffered());
