@@ -165,7 +165,6 @@ pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
             in.fillMore() catch |e| switch (e) {
                 error.EndOfStream => {
                     eof = true;
-                    break;
                 },
                 else => return e,
             };
@@ -443,6 +442,35 @@ test "emits output before input ends (watch-mode progressiveness)" {
 
     try std.testing.expect(saw_progress);
     try std.testing.expectEqualStrings("⬡ ↧-libmnl-1.0.5.drv\n" ++ line2, rw.written.items);
+}
+
+test "emits short bursts before more input arrives" {
+    var buf: [1024]u8 = undefined;
+    var rw = RecordingWriter.init(&buf);
+    defer rw.written.deinit(std.testing.allocator);
+
+    // Both chunks are below the minimum match unit (44 bytes), so the fill
+    // loop must not retain them waiting for a bigger window.
+    const chunks = [_][]const u8{ "short burst\n", "more\n" };
+    var saw_progress = false;
+    var dribble_buffer: [64]u8 = undefined;
+    var dribble = DribbleReader{
+        .interface = .{
+            .vtable = &.{ .stream = DribbleReader.stream },
+            .buffer = &dribble_buffer,
+            .seek = 0,
+            .end = 0,
+        },
+        .chunks = &chunks,
+        .writer_state = &rw,
+        .saw_progress = &saw_progress,
+    };
+
+    try mojipath(&dribble.interface, &rw.writer, false);
+    try rw.writer.flush();
+
+    try std.testing.expect(saw_progress);
+    try std.testing.expectEqualStrings("short burst\nmore\n", rw.written.items);
 }
 
 test {
