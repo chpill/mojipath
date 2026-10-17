@@ -16,7 +16,6 @@
       "aarch64-linux-musl"
       "aarch64-macos"
       "x86_64-macos"
-      "x86_64-windows-gnu"
     ];
     forAllSystems = f: nixpkgs.lib.genAttrs systems f;
     nativeTarget = system:
@@ -126,15 +125,6 @@
         mojipath-aarch64-linux-musl =
           mkSmoke "aarch64-linux-musl" [ pkgs.qemu ]
             "qemu-aarch64 ${pkgs'.mojipath-aarch64-linux-musl}/bin/mojipath";
-        mojipath-x86_64-windows-gnu =
-          pkgs.runCommand "mojipath-smoke-x86_64-windows-gnu" {
-            nativeBuildInputs = [ pkgs.wine64 ];
-          } (''
-            export WINEPREFIX=$TMPDIR/wineprefix HOME=$TMPDIR DISPLAY= WINEDEBUG=-all
-            export WINEDLLOVERRIDES=mscoree,mshtml=
-            wineboot -u
-          '' + smokeCmd "wine ${pkgs'.mojipath-x86_64-windows-gnu}/bin/mojipath.exe"
-          + "\necho ok > $out");
       } else if system == "aarch64-linux" then linuxChecks // {
         mojipath-aarch64-linux-musl =
           mkSmoke "aarch64-linux-musl" [ ] "${pkgs'.mojipath-aarch64-linux-musl}/bin/mojipath";
@@ -153,8 +143,6 @@
           pkgs.qemu
           zig-package
           zls-package
-        ] ++ pkgs.lib.optionals (system == "x86_64-linux") [
-          pkgs.wine64
         ];
       };
     });
