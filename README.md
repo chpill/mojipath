@@ -17,6 +17,10 @@ $ nix build 2>&1 | mojipath --color=always
 Colors are 24-bit terminal escapes. `--color=auto` (the default) enables them
 only when stdout is a terminal; force them with `--color=always` when piping.
 
+Output flows progressively, so watch-style producers stay live. If input goes
+idle for 10ms, any partially received bytes are flushed as-is — a store path
+split across such a gap therefore stays raw.
+
 ## Shell integration
 
 Wrap individual noisy commands. Stdout is a pipe here, so `always` is needed:

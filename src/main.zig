@@ -154,24 +154,79 @@ fn emitMatch(out: *Io.Writer, hash_and_prefix: []const u8, color: bool) !void {
     }
 }
 
-pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool) !void {
-    var eof = false;
-    while (true) {
-        // Wait only for the minimum unit a decision can be made about, so
-        // interactive (watch-style) input stays progressive; full windows
-        // still arrive per-read from bulk sources.
-        const min_window = @min(match_unit_len, in.buffer.len);
-        while (!eof and in.bufferedLen() < min_window) {
-            in.fillMore() catch |e| switch (e) {
+/// Injected wait-for-input policy; time enters mojipath only as this
+/// abstraction, so tests can script idle periods deterministically.
+pub const WaitResult = enum { input_ready, timeout };
+
+pub const Readiness = struct {
+    ctx: *anyopaque,
+    waitFn: *const fn (ctx: *anyopaque, timeout_ns: u64) WaitResult,
+
+    pub fn wait(self: Readiness, timeout_ns: u64) WaitResult {
+        return self.waitFn(self.ctx, timeout_ns);
+    }
+};
+
+/// Rewrites a store path when input has been idle this long, accepting that
+/// a path split across the gap stays raw.
+pub const idle_flush_ns: u64 = 10 * std.time.ns_per_ms;
+
+const FillResult = enum { filled, idle };
+
+/// Performs one read; with a readiness policy, gates it so idle gaps are
+/// reported instead of blocking.
+fn fillOne(in: *Io.Reader, readiness: ?Readiness, eof: *bool) !FillResult {
+    const doFill = struct {
+        fn go(reader: *Io.Reader, eof_ptr: *bool) !void {
+            reader.fillMore() catch |e| switch (e) {
                 error.EndOfStream => {
-                    eof = true;
+                    eof_ptr.* = true;
                 },
                 else => return e,
             };
         }
-        const window = in.buffered();
+    }.go;
+
+    if (readiness) |r| {
+        switch (r.wait(idle_flush_ns)) {
+            .input_ready => {
+                try doFill(in, eof);
+                return .filled;
+            },
+            .timeout => return .idle,
+        }
+    }
+    try doFill(in, eof);
+    return .filled;
+}
+
+pub fn mojipath(in: *Io.Reader, out: *Io.Writer, color: bool, readiness: ?Readiness) !void {
+    var eof = false;
+    outer: while (true) {
+        // Process whatever a single read delivered; interactive (watch-style)
+        // input stays progressive, bulk reads still deliver full windows.
+        while (!eof and in.bufferedLen() == 0) {
+            _ = try fillOne(in, readiness, &eof);
+        }
+        var window = in.buffered();
         if (window.len == 0) return;
-        const consumed = try processWindow(window, out, color, eof);
+        var consumed = try processWindow(window, out, color, eof);
+        while (consumed == 0 and !eof) {
+            // The window consists only of a pending path-prefix candidate;
+            // wait for more input, or flush it raw when input goes idle.
+            switch (try fillOne(in, readiness, &eof)) {
+                .filled => {
+                    window = in.buffered();
+                    consumed = try processWindow(window, out, color, eof);
+                },
+                .idle => {
+                    consumed = try processWindow(in.buffered(), out, color, true);
+                    in.toss(consumed);
+                    try out.flush();
+                    continue :outer;
+                },
+            }
+        }
         in.toss(consumed);
     }
 }
@@ -318,9 +373,11 @@ pub fn main(init: std.process.Init) !u8 {
     const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
 
+    var stdin_readiness = StdinReadiness{ .fd = std.Io.File.stdin().handle };
+
     // TODO: error.WriteFailed should be unwrapped to surface the root problem?
     // https://ziggit.dev/t/file-i-o-basics-0-16/14968/4
-    mojipath(stdin, stdout, color) catch |err| switch (err) {
+    mojipath(stdin, stdout, color, stdin_readiness.readiness()) catch |err| switch (err) {
         error.ReadFailed => return stdin_reader.err.?,
         error.WriteFailed => return stdout_writer.err.?,
         else => return err,
@@ -330,12 +387,34 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// Gates stdin reads with poll() so idle gaps surface as timeouts instead of
+/// blocking indefinitely.
+const StdinReadiness = struct {
+    fd: std.posix.fd_t,
+
+    fn readiness(self: *StdinReadiness) Readiness {
+        return .{ .ctx = self, .waitFn = wait };
+    }
+
+    fn wait(ctx: *anyopaque, timeout_ns: u64) WaitResult {
+        const self: *StdinReadiness = @ptrCast(@alignCast(ctx));
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const timeout_ms: i32 = @intCast(@min(timeout_ns / std.time.ns_per_ms, std.math.maxInt(i32)));
+        const n = std.posix.poll(&fds, timeout_ms) catch return .timeout;
+        return if (n == 0) .timeout else .input_ready;
+    }
+};
+
 fn check(input: []const u8, output: []const u8, color: bool) !void {
     var reader = std.Io.Reader.fixed(input);
     var out_buf: [window_size + 128]u8 = undefined;
     var writer = Io.Writer.fixed(&out_buf);
 
-    try mojipath(&reader, &writer, color);
+    try mojipath(&reader, &writer, color, null);
 
     try std.testing.expectEqualStrings(output, writer.buffered());
 }
@@ -407,7 +486,7 @@ test "flushes per line and per carriage return" {
     var reader = Io.Reader.fixed("abc\rdef\n");
     defer rw.written.deinit(std.testing.allocator);
 
-    try mojipath(&reader, &rw.writer, false);
+    try mojipath(&reader, &rw.writer, false, null);
 
     // Newline bytes must trigger flushing; the exact count is an
     // implementation detail (batched writes flush once for several).
@@ -437,7 +516,7 @@ test "emits output before input ends (watch-mode progressiveness)" {
         .saw_progress = &saw_progress,
     };
 
-    try mojipath(&dribble.interface, &rw.writer, false);
+    try mojipath(&dribble.interface, &rw.writer, false, null);
     try rw.writer.flush();
 
     try std.testing.expect(saw_progress);
@@ -466,11 +545,62 @@ test "emits short bursts before more input arrives" {
         .saw_progress = &saw_progress,
     };
 
-    try mojipath(&dribble.interface, &rw.writer, false);
+    try mojipath(&dribble.interface, &rw.writer, false, null);
     try rw.writer.flush();
 
     try std.testing.expect(saw_progress);
     try std.testing.expectEqualStrings("short burst\nmore\n", rw.written.items);
+}
+
+const ScriptedReadiness = struct {
+    events: []const WaitResult,
+    idx: usize = 0,
+    first_timeout: ?u64 = null,
+
+    fn readiness(self: *ScriptedReadiness) Readiness {
+        return .{ .ctx = self, .waitFn = wait };
+    }
+
+    fn wait(ctx: *anyopaque, timeout_ns: u64) WaitResult {
+        const self: *ScriptedReadiness = @ptrCast(@alignCast(ctx));
+        if (self.first_timeout == null) self.first_timeout = timeout_ns;
+        if (self.idx >= self.events.len) return .input_ready;
+        const event = self.events[self.idx];
+        self.idx += 1;
+        return event;
+    }
+};
+
+test "flushes retained path-prefix bytes when input goes idle" {
+    var buf: [1024]u8 = undefined;
+    var rw = RecordingWriter.init(&buf);
+    defer rw.written.deinit(std.testing.allocator);
+
+    // The stream pauses right after a partial path prefix; the idle flush
+    // must release it raw, and the completion must not match across the gap.
+    const chunks = [_][]const u8{ "/nix/st", "ore/m2yvkibsf6icc5csqjkm5ldbwgml7zs0-x\n" };
+    const events = [_]WaitResult{ .input_ready, .timeout, .input_ready };
+    var saw_progress = false;
+    var scripted = ScriptedReadiness{ .events = &events };
+    var dribble_buffer: [64]u8 = undefined;
+    var dribble = DribbleReader{
+        .interface = .{
+            .vtable = &.{ .stream = DribbleReader.stream },
+            .buffer = &dribble_buffer,
+            .seek = 0,
+            .end = 0,
+        },
+        .chunks = &chunks,
+        .writer_state = &rw,
+        .saw_progress = &saw_progress,
+    };
+
+    try mojipath(&dribble.interface, &rw.writer, false, scripted.readiness());
+    try rw.writer.flush();
+
+    try std.testing.expect(saw_progress);
+    try std.testing.expectEqual(idle_flush_ns, scripted.first_timeout.?);
+    try std.testing.expectEqualStrings("/nix/st" ++ "ore/m2yvkibsf6icc5csqjkm5ldbwgml7zs0-x\n", rw.written.items);
 }
 
 test {
@@ -563,7 +693,7 @@ test "fuzz: windowed output matches reference implementation" {
         var b_buf: [2 * 8192]u8 = undefined;
         var bw = Io.Writer.fixed(&b_buf);
 
-        try mojipath(&a, &aw, iter % 2 == 0);
+        try mojipath(&a, &aw, iter % 2 == 0, null);
         try refMojipath(&b, &bw, iter % 2 == 0);
 
         try std.testing.expectEqualStrings(bw.buffered(), aw.buffered());

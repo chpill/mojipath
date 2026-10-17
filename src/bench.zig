@@ -71,7 +71,7 @@ fn runRef(input: []const u8, out_buf: []u8) !usize {
 fn runCur(input: []const u8, out_buf: []u8) !usize {
     var reader = std.Io.Reader.fixed(input);
     var writer = Io.Writer.fixed(out_buf);
-    try mojimod.mojipath(&reader, &writer, false);
+    try mojimod.mojipath(&reader, &writer, false, null);
     return writer.buffered().len;
 }
 
