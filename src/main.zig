@@ -378,6 +378,11 @@ pub fn main(init: std.process.Init) !u8 {
 
 /// Gates stdin reads with poll() so idle gaps surface as timeouts instead of
 /// blocking indefinitely.
+///
+/// This is deliberately the program's only raw POSIX call: std.Io has no
+/// file-readiness primitive yet (only MultiReader's concurrent-batch
+/// fill(timeout), which is heavy for one fd). Everything else goes through
+/// std.Io, so porting means rewriting this one wait body.
 const StdinReadiness = struct {
     fd: std.posix.fd_t,
 
